@@ -13,12 +13,14 @@ import express from "express";
 import cors from "cors";
 import Groq from "groq-sdk";
 import "dotenv/config";
-import { writeFile, mkdir, readdir, stat } from "fs/promises";
+import { writeFile, mkdir, readdir, stat, unlink } from "fs/promises";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
 import fs from "fs";
 import axios from "axios";
+import { ensureAudioForMerge, cleanupTempAudioFiles } from "./lib/audio.js";
+import { generateNepaliVoice, verifyAudioFile } from "./lib/tts.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -33,6 +35,19 @@ const NARRATION_LANGUAGE = process.env.NARRATION_LANGUAGE || "nepali"; // "nepal
 
 app.use(cors());
 app.use(express.json());
+
+// Serve generated outputs (op.mp4 etc.) from project-level ./output
+try {
+  const outputsStatic = join(__dirname, "..", "output");
+  if (!fs.existsSync(outputsStatic)) {
+    // create so express.static won't fail later
+    await mkdir(outputsStatic, { recursive: true });
+  }
+  app.use("/output", express.static(outputsStatic));
+  console.log(`ℹ️ Serving output files from: ${outputsStatic} at /output`);
+} catch (e) {
+  console.warn(`⚠️ Could not set up static output serving: ${e.message}`);
+}
 
 app.get("/", (req, res) => res.send("✅ AI Video Generator Backend Running"));
 
@@ -200,16 +215,32 @@ app.post("/generateVideo", async (req, res) => {
       console.log(`🔁 Creating fallback combined file at: ${opPath}`);
 
       await new Promise((resolve, reject) => {
+        // Transcode into H.264 + AAC for broad browser compatibility
         const ff = spawn("ffmpeg", [
           "-y",
           "-i",
           fixedCodeResult.videoPath,
           "-i",
           audioToUseForOp,
+          // ensure output is H.264 (widely supported) and audio is AAC
           "-c:v",
-          "copy",
+          "libx264",
+          "-preset",
+          "veryfast",
+          "-crf",
+          "23",
+          "-pix_fmt",
+          "yuv420p",
+          "-profile:v",
+          "high",
+          "-level",
+          "4.0",
+          "-movflags",
+          "+faststart",
           "-c:a",
           "aac",
+          "-b:a",
+          "192k",
           opPath,
         ]);
 
@@ -226,6 +257,11 @@ app.post("/generateVideo", async (req, res) => {
           console.log();
           if (code === 0 && fs.existsSync(opPath)) {
             console.log(`✅ Wrote op file: ${opPath}`);
+            // cleanup temp audio files used for op generation
+            try {
+              const opDir = projectOutputDir;
+              cleanupTempAudioFiles(opDir).catch(() => {});
+            } catch (e) {}
             resolve();
           } else {
             reject(new Error(`ffmpeg failed (${code})\n${stderr}`));
@@ -235,6 +271,91 @@ app.post("/generateVideo", async (req, res) => {
     } catch (e) {
       console.error(`❌ Failed to create ./output/op.mp4: ${e.message}`);
       opPath = null;
+    }
+
+    // --- AI feedback generation (optional, post-processing)
+    let feedbackJSON = { summary: null };
+    let feedbackVideoPath = null;
+    let feedbackAudioPath = null;
+    try {
+      console.log("🧠 Generating AI feedback on video...");
+
+      const feedbackPrompt = `
+You are an AI video critique assistant.
+The following scene was generated based on the description below.
+Provide a JSON object with clear, structured feedback including:
+1. \"summary\": concise explanation of what the video covers
+2. \"visual_feedback\": how the visuals could be improved
+3. \"narration_feedback\": how the narration could be made more engaging
+4. \"manim_code\": a short Manim scene visualizing your feedback or a related concept (if relevant)
+
+Return only valid JSON.
+
+DESCRIPTION: ${description}
+SCENE PLAN: ${JSON.stringify(scenePlan, null, 2)}
+`;
+
+      const feedbackResp = await groq.chat.completions.create({
+        model: "llama-3.3-70b-versatile",
+        temperature: 0.4,
+        messages: [
+          {
+            role: "system",
+            content: "You are a precise and structured JSON-only responder.",
+          },
+          { role: "user", content: feedbackPrompt },
+        ],
+      });
+
+      try {
+        const raw = feedbackResp.choices?.[0]?.message?.content || "";
+        const clean = raw.replace(/^```json\n?/, "").replace(/```$/, "");
+        feedbackJSON = JSON.parse(clean);
+        console.log("🧠 Feedback generated successfully:", feedbackJSON);
+      } catch (err) {
+        console.warn("⚠️ Failed to parse feedback JSON, storing raw response.");
+        feedbackJSON = {
+          summary: null,
+          raw: feedbackResp.choices?.[0]?.message?.content || "",
+        };
+      }
+
+      // Optional: render feedback into a Manim scene if manim_code present
+      if (feedbackJSON.manim_code) {
+        try {
+          const fbFilePath = join(
+            __dirname,
+            "scripts",
+            `FeedbackScene_${Date.now()}.py`
+          );
+          await writeFile(fbFilePath, feedbackJSON.manim_code, "utf-8");
+
+          // attempt to detect class name from the provided code
+          const classMatch = (feedbackJSON.manim_code || "").match(
+            /class\s+([A-Za-z0-9_]+)\s*\(/
+          );
+          const sceneNameForFb = classMatch ? classMatch[1] : "FeedbackScene";
+
+          const fbResult = await runManim(fbFilePath, sceneNameForFb);
+          feedbackVideoPath = fbResult.videoPath || null;
+        } catch (e) {
+          console.error("❌ Failed to render feedback Manim scene:", e.message);
+          feedbackVideoPath = null;
+        }
+      }
+
+      // Optional: generate voice for the feedback summary
+      if (feedbackJSON.summary) {
+        try {
+          feedbackAudioPath = await generateNepaliVoice(feedbackJSON.summary);
+        } catch (e) {
+          console.error("❌ Failed to generate feedback audio:", e.message);
+          feedbackAudioPath = null;
+        }
+      }
+    } catch (e) {
+      console.error("❌ Feedback generation failed:", e.message || e);
+      feedbackJSON = { summary: null };
     }
 
     res.json({
@@ -248,6 +369,10 @@ app.post("/generateVideo", async (req, res) => {
       manimErrors: fixedCodeResult.errors,
       attempts: fixedCodeResult.attempts,
       language: targetLanguage,
+      feedback: feedbackJSON,
+      feedbackVideo: feedbackVideoPath,
+      feedbackAudio: feedbackAudioPath,
+      opPath,
     });
   } catch (error) {
     console.error("❌ Error in /generateVideo:", error);
@@ -780,277 +905,9 @@ async function findLatestMp4(mediaRoot, sceneName) {
   return newest;
 }
 
-/* -------------------- 11Labs TTS -------------------- */
+// TTS helpers moved to server/lib/tts.js (generateNepaliVoice, verifyAudioFile)
 
-async function generateNepaliVoice(text) {
-  if (!ELEVENLABS_KEY) throw new Error("ELEVENLABS_API_KEY not set in .env");
-  if (!text || text.trim().length === 0) {
-    throw new Error("Cannot generate voice for empty text");
-  }
-
-  const scriptsPath = join(__dirname, "scripts");
-  await mkdir(scriptsPath, { recursive: true });
-  const outputPath = join(scriptsPath, `voice_${Date.now()}.mp3`);
-
-  const voiceId = ELEVENLABS_VOICE_ID;
-
-  console.log(`🎤 Requesting TTS from ElevenLabs`);
-  console.log(`   Voice ID: ${voiceId}`);
-  console.log(`   Text length: ${text.length} chars`);
-  console.log(`   Text preview: ${text.substring(0, 100)}...`);
-
-  const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`;
-  const payload = {
-    text: text.trim(),
-    model_id: "eleven_multilingual_v2",
-    voice_settings: {
-      stability: 0.5,
-      similarity_boost: 0.75,
-      style: 0.0,
-      use_speaker_boost: true,
-    },
-  };
-
-  try {
-    const resp = await axios.post(url, payload, {
-      headers: {
-        "xi-api-key": ELEVENLABS_KEY,
-        "Content-Type": "application/json",
-        Accept: "audio/mpeg",
-      },
-      responseType: "arraybuffer",
-      timeout: 120000,
-      validateStatus: (status) => status < 500,
-    });
-
-    if (resp.status !== 200) {
-      const errorText = Buffer.from(resp.data).toString("utf-8");
-      console.error(`❌ ElevenLabs API error (${resp.status}):`, errorText);
-      throw new Error(`ElevenLabs API returned ${resp.status}: ${errorText}`);
-    }
-
-    const audioBuffer = Buffer.from(resp.data);
-    if (audioBuffer.length === 0) {
-      throw new Error("ElevenLabs returned empty audio data");
-    }
-
-    console.log(`✅ Received ${audioBuffer.length} bytes of audio data`);
-
-    await writeFile(outputPath, audioBuffer);
-
-    const stats = await stat(outputPath);
-    console.log(`✅ Voice file written: ${outputPath} (${stats.size} bytes)`);
-
-    await verifyAudioFile(outputPath);
-
-    return outputPath;
-  } catch (error) {
-    console.error("❌ ElevenLabs TTS error:", error.message);
-
-    if (error.response) {
-      console.error(`   Status: ${error.response.status}`);
-      console.error(`   Headers:`, error.response.headers);
-
-      try {
-        const errorBody = Buffer.from(error.response.data).toString("utf-8");
-        console.error(`   Body: ${errorBody}`);
-      } catch (e) {
-        console.error(`   Could not parse error body`);
-      }
-    }
-
-    throw error;
-  }
-}
-
-// -------------------- Audio helpers --------------------
-/** Get media duration in seconds using ffprobe */
-function getMediaDuration(filePath) {
-  return new Promise((resolve) => {
-    const p = spawn("ffprobe", [
-      "-v",
-      "error",
-      "-show_entries",
-      "format=duration",
-      "-of",
-      "default=noprint_wrappers=1:nokey=1",
-      filePath,
-    ]);
-    let out = "";
-    p.stdout.on("data", (d) => (out += d.toString()));
-    p.on("close", (code) => {
-      if (code === 0) {
-        const v = parseFloat(out.trim());
-        resolve(isNaN(v) ? 0 : v);
-      } else resolve(0);
-    });
-    p.on("error", () => resolve(0));
-  });
-}
-
-/** Create a silent audio file of given duration (seconds) and return path */
-function createSilentAudio(durationSec, destPath) {
-  return new Promise((resolve, reject) => {
-    const dur = Math.max(0.5, Number(durationSec) || 1).toFixed(2);
-    const args = [
-      "-y",
-      "-f",
-      "lavfi",
-      "-i",
-      `anullsrc=channel_layout=stereo:sample_rate=44100`,
-      "-t",
-      dur,
-      "-c:a",
-      "aac",
-      "-b:a",
-      "128k",
-      destPath,
-    ];
-
-    const ff = spawn("ffmpeg", args);
-    let stderr = "";
-    ff.stderr.on("data", (d) => (stderr += d.toString()));
-    ff.on("close", (code) => {
-      if (code === 0 && fs.existsSync(destPath)) resolve(destPath);
-      else reject(new Error(`createSilentAudio failed: ${stderr}`));
-    });
-    ff.on("error", (e) => reject(e));
-  });
-}
-
-/** Ensure audio duration matches video duration by trimming or padding (returns path) */
-async function padOrTrimAudioToMatch(videoPath, audioPath, outputDir) {
-  // If audio doesn't exist, create silent audio of video duration
-  if (!audioPath || !fs.existsSync(audioPath)) {
-    const videoDur = await getMediaDuration(videoPath);
-    const out = join(outputDir, `silent_${Date.now()}.m4a`);
-    await createSilentAudio(videoDur || 1, out);
-    return out;
-  }
-
-  const videoDur = await getMediaDuration(videoPath);
-  const audioDur = await getMediaDuration(audioPath);
-  const eps = 0.05;
-
-  // If audio is longer than video, trim it
-  if (audioDur > videoDur + eps) {
-    const out = join(outputDir, `audio_trim_${Date.now()}.m4a`);
-    await new Promise((resolve, reject) => {
-      const ff = spawn("ffmpeg", [
-        "-y",
-        "-i",
-        audioPath,
-        "-t",
-        `${videoDur.toFixed(2)}`,
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-        out,
-      ]);
-      let stderr = "";
-      ff.stderr.on("data", (d) => (stderr += d.toString()));
-      ff.on("close", (code) => {
-        if (code === 0 && fs.existsSync(out)) resolve(out);
-        else reject(new Error(`trim failed: ${stderr}`));
-      });
-      ff.on("error", (e) => reject(e));
-    });
-    return out;
-  }
-
-  // If audio is shorter, append silence
-  if (audioDur < videoDur - eps) {
-    const diff = Math.max(0.5, videoDur - audioDur);
-    const silentPart = join(outputDir, `pad_silent_${Date.now()}.m4a`);
-    await createSilentAudio(diff, silentPart);
-
-    const out = join(outputDir, `audio_padded_${Date.now()}.m4a`);
-    await new Promise((resolve, reject) => {
-      // concat two audio streams
-      const ff = spawn("ffmpeg", [
-        "-y",
-        "-i",
-        audioPath,
-        "-i",
-        silentPart,
-        "-filter_complex",
-        "[0:a][1:a]concat=n=2:v=0:a=1[a]",
-        "-map",
-        "[a]",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-        out,
-      ]);
-      let stderr = "";
-      ff.stderr.on("data", (d) => (stderr += d.toString()));
-      ff.on("close", (code) => {
-        if (code === 0 && fs.existsSync(out)) resolve(out);
-        else reject(new Error(`pad concat failed: ${stderr}`));
-      });
-      ff.on("error", (e) => reject(e));
-    });
-    return out;
-  }
-
-  // Durations close enough — return original audioPath
-  return audioPath;
-}
-
-/** Ensure there's an audio file to merge and that its duration matches the video */
-async function ensureAudioForMerge(videoPath, audioPath, outputDir) {
-  await mkdir(outputDir, { recursive: true });
-  const prepared = await padOrTrimAudioToMatch(videoPath, audioPath, outputDir);
-  return prepared;
-}
-
-/** Verify an audio file exists and contains an audio stream. Returns metadata. */
-async function verifyAudioFile(filePath) {
-  if (!filePath || !fs.existsSync(filePath)) {
-    throw new Error(`Audio file does not exist: ${filePath}`);
-  }
-  const s = await stat(filePath);
-  const size = s.size || 0;
-  return new Promise((resolve) => {
-    const p = spawn("ffprobe", [
-      "-v",
-      "error",
-      "-print_format",
-      "json",
-      "-show_format",
-      "-show_streams",
-      filePath,
-    ]);
-    let out = "";
-    p.stdout.on("data", (d) => (out += d.toString()));
-    p.on("close", (code) => {
-      if (code !== 0)
-        return resolve({ exists: true, size, duration: 0, hasAudio: false });
-      try {
-        const info = JSON.parse(out || "{}");
-        const streams = info.streams || [];
-        const format = info.format || {};
-        const hasAudio = streams.some((st) => st.codec_type === "audio");
-        const duration = parseFloat(format.duration) || 0;
-        resolve({
-          exists: true,
-          size,
-          duration,
-          hasAudio,
-          format: format.format_name,
-          streams,
-        });
-      } catch (e) {
-        resolve({ exists: true, size, duration: 0, hasAudio: false });
-      }
-    });
-    p.on("error", () =>
-      resolve({ exists: true, size, duration: 0, hasAudio: false })
-    );
-  });
-}
+// Audio helpers are implemented in server/lib/audio.js and TTS helpers in server/lib/tts.js
 
 /* ==================================================================================
    ENHANCED FFMPEG MERGE FUNCTIONS
@@ -1135,6 +992,10 @@ async function mergeVideoAndAudio(videoPath, audioPath, options = {}) {
       if (code === 0 && fs.existsSync(outFile)) {
         const stats = fs.statSync(outFile);
         if (stats.size > 0) {
+          // attempt cleanup of temp audio files in outputDir
+          try {
+            cleanupTempAudioFiles(outputDir).catch(() => {});
+          } catch (e) {}
           console.log(`✅ Successfully merged video and audio`);
           console.log(
             `   📊 Output size: ${(stats.size / (1024 * 1024)).toFixed(2)} MB`
