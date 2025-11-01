@@ -1,12 +1,12 @@
 /**
- * AI Video Generator Backend (single file)
- * ----------------------------------------
+ * AI Video Generator Backend (Complete with Audio Fixes)
+ * --------------------------------------------------------
  * Groq (LLM) -> Manim CE (auto-fix loop) -> ElevenLabs TTS -> ffmpeg merge
  *
  * Requirements:
  * - .env with GROQ_API_KEY and ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID
  * - A Python venv with manim installed at ./scripts/myvenv (Activate.ps1 for Windows)
- * - ffmpeg available in PATH
+ * - ffmpeg and ffprobe available in PATH
  */
 
 import express from "express";
@@ -28,7 +28,8 @@ const PORT = process.env.PORT || 5000;
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const ELEVENLABS_KEY = process.env.ELEVENLABS_API_KEY;
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "YOUR_VOICE_ID";
-const MANIM_TIMEOUT_MS = parseInt(process.env.MANIM_TIMEOUT_MS || "120000"); // default 2 min
+const MANIM_TIMEOUT_MS = parseInt(process.env.MANIM_TIMEOUT_MS || "120000");
+const NARRATION_LANGUAGE = process.env.NARRATION_LANGUAGE || "nepali"; // "nepali" or "english"
 
 app.use(cors());
 app.use(express.json());
@@ -42,7 +43,6 @@ app.post("/testManim", async (req, res) => {
   try {
     const scriptsPath = join(__dirname, "scripts");
 
-    // Create a simple test scene
     const testCode = `from manim import *
 
 class TestScene(Scene):
@@ -78,21 +78,86 @@ class TestScene(Scene):
 });
 
 /**
+ * Debug endpoint to test audio generation
+ */
+app.post("/testAudio", async (req, res) => {
+  try {
+    const { text } = req.body;
+    if (!text) {
+      return res.status(400).json({ error: "Text is required" });
+    }
+
+    console.log("🎤 Testing audio generation...");
+    const audioPath = await generateNepaliVoice(text);
+
+    const audioInfo = await verifyAudioFile(audioPath);
+
+    res.json({
+      status: "success",
+      audioPath,
+      audioInfo,
+      fileSize: (await stat(audioPath)).size,
+    });
+  } catch (error) {
+    console.error("❌ Audio test failed:", error);
+    res.status(500).json({
+      status: "error",
+      message: error.message,
+      stack: error.stack,
+    });
+  }
+});
+
+/**
+ * Test merging endpoint
+ */
+app.post("/testMerge", async (req, res) => {
+  try {
+    const { videoPath, audioPath } = req.body;
+    if (!videoPath || !audioPath) {
+      return res
+        .status(400)
+        .json({ error: "videoPath and audioPath required" });
+    }
+
+    console.log("🎬 Testing merge...");
+    const finalVideo = await mergeVideoAndAudio(videoPath, audioPath);
+
+    res.json({
+      status: "success",
+      finalVideo,
+      fileSize: (await stat(finalVideo)).size,
+    });
+  } catch (error) {
+    console.error("❌ Merge test failed:", error);
+    res.status(500).json({
+      status: "error",
+      message: error.message,
+      stack: error.stack,
+    });
+  }
+});
+
+/**
  * Main route
  */
 app.post("/generateVideo", async (req, res) => {
   try {
-    const { description } = req.body;
+    const { description, language } = req.body;
     if (!description)
       return res.status(400).json({ error: "Description is required" });
 
-    // 1) Scene plan with narration
-    const scenePlan = await feedbackLoop(generateScenePlan, description);
+    const targetLanguage = language || NARRATION_LANGUAGE;
+    console.log(`🌐 Target language: ${targetLanguage}`);
+
+    const scenePlan = await feedbackLoop(generateScenePlan, {
+      description,
+      language: targetLanguage,
+    });
     if (!scenePlan.scene_name) throw new Error("Scene plan generation failed");
 
     console.log("📝 Scene plan generated:", JSON.stringify(scenePlan, null, 2));
 
-    // 2) Generate & fix Manim until no errors and video exists
     const fixedCodeResult = await generateUntilNoManimErrors(scenePlan);
 
     if (!fixedCodeResult.videoPath) {
@@ -104,12 +169,12 @@ app.post("/generateVideo", async (req, res) => {
       });
     }
 
-    // 3) Generate Nepali voice using the narration from scene plan
     const narrationText = scenePlan.narration || description;
     console.log("🎤 Generating voice for:", narrationText);
+    console.log(`📝 Narration language: ${targetLanguage}`);
+
     const voicePath = await generateNepaliVoice(narrationText);
 
-    // 4) Merge video + audio (enhanced version)
     console.log("🎬 Merging video and audio...");
     const finalVideoPath = await mergeVideoAndAudio(
       fixedCodeResult.videoPath,
@@ -120,15 +185,69 @@ app.post("/generateVideo", async (req, res) => {
       }
     );
 
+    let opPath = null;
+    try {
+      const projectOutputDir = join(__dirname, "..", "output");
+      await mkdir(projectOutputDir, { recursive: true });
+      opPath = join(projectOutputDir, "op.mp4");
+
+      const audioToUseForOp = await ensureAudioForMerge(
+        fixedCodeResult.videoPath,
+        voicePath,
+        projectOutputDir
+      );
+
+      console.log(`🔁 Creating fallback combined file at: ${opPath}`);
+
+      await new Promise((resolve, reject) => {
+        const ff = spawn("ffmpeg", [
+          "-y",
+          "-i",
+          fixedCodeResult.videoPath,
+          "-i",
+          audioToUseForOp,
+          "-c:v",
+          "copy",
+          "-c:a",
+          "aac",
+          opPath,
+        ]);
+
+        let stderr = "";
+        ff.stderr.on("data", (d) => {
+          const txt = d.toString();
+          stderr += txt;
+          if (txt.includes("time=") || txt.includes("frame="))
+            process.stdout.write(`\r${txt.trim()}`);
+        });
+
+        ff.on("error", (err) => reject(err));
+        ff.on("close", (code) => {
+          console.log();
+          if (code === 0 && fs.existsSync(opPath)) {
+            console.log(`✅ Wrote op file: ${opPath}`);
+            resolve();
+          } else {
+            reject(new Error(`ffmpeg failed (${code})\n${stderr}`));
+          }
+        });
+      });
+    } catch (e) {
+      console.error(`❌ Failed to create ./output/op.mp4: ${e.message}`);
+      opPath = null;
+    }
+
     res.json({
       status: "success",
       scenePlan,
       manimCode: fixedCodeResult.manimCode,
+      silentVideo: fixedCodeResult.videoPath,
       finalVideo: finalVideoPath,
       voice: voicePath,
       manimOutput: fixedCodeResult.output,
       manimErrors: fixedCodeResult.errors,
       attempts: fixedCodeResult.attempts,
+      language: targetLanguage,
     });
   } catch (error) {
     console.error("❌ Error in /generateVideo:", error);
@@ -145,7 +264,7 @@ app.listen(PORT, () =>
 );
 
 /* =======================================================================
-   CORE: generateUntilNoManimErrors -> feedbackLoop -> runManim -> findLatestMp4
+   CORE FUNCTIONS
    ======================================================================= */
 
 async function generateUntilNoManimErrors(scenePlan, maxAttempts = 3) {
@@ -159,7 +278,6 @@ async function generateUntilNoManimErrors(scenePlan, maxAttempts = 3) {
     attempt++;
     console.log(`🌀 Attempt ${attempt}: generating and running Manim code...`);
 
-    // A: Generate code (with JSON feedback loop)
     manimCodeJSON = await feedbackLoop(generateManimCode, scenePlan);
     if (!manimCodeJSON || !manimCodeJSON.manim_code) {
       console.warn("No manim_code produced; aborting attempt.");
@@ -171,7 +289,6 @@ async function generateUntilNoManimErrors(scenePlan, maxAttempts = 3) {
       };
     }
 
-    // Save script
     const filePath = join(scriptsPath, `${scenePlan.scene_name}.py`);
     await writeFile(filePath, manimCodeJSON.manim_code, "utf-8");
 
@@ -183,7 +300,6 @@ async function generateUntilNoManimErrors(scenePlan, maxAttempts = 3) {
       )}...`
     );
 
-    // B: Run Manim and attempt to find produced mp4
     manimResult = await runManim(filePath, scenePlan.scene_name);
 
     const noErrors = !manimResult.errors || manimResult.errors.trim() === "";
@@ -208,7 +324,6 @@ async function generateUntilNoManimErrors(scenePlan, maxAttempts = 3) {
       "⚠️ Manim reported errors or no video. Preparing correction payload..."
     );
 
-    // C: Prepare for correction - include limited error & previous code
     scenePlan = {
       ...scenePlan,
       previous_code: manimCodeJSON.manim_code,
@@ -216,7 +331,6 @@ async function generateUntilNoManimErrors(scenePlan, maxAttempts = 3) {
       manim_video_missing: !hasVideo,
     };
 
-    // small delay before retrying
     await new Promise((r) => setTimeout(r, 1000));
   }
 
@@ -230,11 +344,6 @@ async function generateUntilNoManimErrors(scenePlan, maxAttempts = 3) {
   };
 }
 
-/* -------------------- feedbackLoop -------------------- */
-/**
- * Repeatedly calls generateFn(input) and parses returned JSON content.
- * Expects generateFn to return an LLM response object (with choices[0].message.content).
- */
 async function feedbackLoop(generateFn, input, maxRetries = 3) {
   let lastRawContent = "";
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -243,7 +352,6 @@ async function feedbackLoop(generateFn, input, maxRetries = 3) {
       const content = aiResponse.choices?.[0]?.message?.content || "";
       lastRawContent = content.trim();
 
-      // strip triple-backtick fences if present
       const stripped = lastRawContent
         .replace(/^```(?:json)?\n?/, "")
         .replace(/```$/, "");
@@ -256,7 +364,6 @@ async function feedbackLoop(generateFn, input, maxRetries = 3) {
           err?.message || "parse error"
         })`
       );
-      // Build a concise repair prompt as next input
       input = {
         role: "user",
         content: `Previous output could not be parsed as valid JSON:\n${lastRawContent}\n\nPlease return a strict JSON object only, matching the expected schema. No explanation.`,
@@ -270,7 +377,17 @@ async function feedbackLoop(generateFn, input, maxRetries = 3) {
 
 /* -------------------- LLM helpers -------------------- */
 
-async function generateScenePlan(description) {
+async function generateScenePlan(input) {
+  const { description, language } =
+    typeof input === "string"
+      ? { description: input, language: "nepali" }
+      : input;
+
+  const languageInstruction =
+    language === "nepali"
+      ? "Write the narration ONLY in Nepali (Devanagari script). This is CRITICAL - the narration MUST be in Nepali language."
+      : "Write the narration in English.";
+
   return await groq.chat.completions.create({
     model: "llama-3.3-70b-versatile",
     temperature: 0.3,
@@ -285,27 +402,30 @@ Return ONLY JSON in this format:
   "scene_name": "SceneName",
   "objects": ["list of objects"],
   "actions": ["list of actions in order"],
-  "narration": "Clear, educational narration text that explains the concept (in English or Nepali as appropriate)",
+  "narration": "Clear, educational narration text",
   "captions": [
     {"text": "Caption 1", "start_time": 0, "duration": 3},
     {"text": "Caption 2", "start_time": 3, "duration": 4}
   ]
 }
 
-Captions should sync with the narration timing and be concise.
+${languageInstruction}
+
+IMPORTANT: The narration field must contain the actual narration text in ${language}, not a description of what to say.
+Make the narration engaging and educational, explaining the concept clearly.
+Captions should be concise and sync with narration timing.
 `,
       },
       {
         role: "user",
-        content: `Create a scene plan with narration and captions for: "${description}". Return ONLY JSON.`,
+        content: `Create a scene plan with narration (in ${language}) and captions for: "${description}". 
+
+Remember: Write the narration text in ${language} language. Return ONLY JSON.`,
       },
     ],
   });
 }
 
-/**
- * When scenePlanJSON includes manim_error and previous_code, the model should fix the code.
- */
 async function generateManimCode(scenePlanJSON) {
   const messages = [
     {
@@ -396,11 +516,6 @@ If fixing code, only change what's broken. Keep working parts unchanged.
 
 /* -------------------- runManim + findLatestMp4 -------------------- */
 
-/**
- * Spawns a PowerShell process that activates the venv and runs manim.
- * Finds the newest mp4 under scripts/media/videos (prefer sceneName folder).
- * Adds a timeout to avoid indefinite hangs.
- */
 async function runManim(filePath, sceneName) {
   return new Promise((resolve) => {
     const scriptsPath = join(__dirname, "scripts");
@@ -415,9 +530,6 @@ async function runManim(filePath, sceneName) {
     console.log(`   Scene: ${sceneName}`);
     console.log(`   Venv: ${venvActivate}`);
     console.log(`   Working dir: ${scriptsPath}`);
-
-    // Use -o flag to specify output directory explicitly
-    const outputDir = join(scriptsPath, "media", "videos", sceneName);
 
     const ps = spawn(
       "powershell.exe",
@@ -437,7 +549,6 @@ async function runManim(filePath, sceneName) {
       }
     );
 
-    // collect logs
     ps.stdout.on("data", (d) => {
       const txt = d.toString();
       output += txt;
@@ -449,7 +560,6 @@ async function runManim(filePath, sceneName) {
       console.error("[manim stderr]", txt);
     });
 
-    // safety timeout
     const timeout = setTimeout(() => {
       if (!finished) {
         console.warn("⏱ Manim timed out; killing process");
@@ -467,14 +577,11 @@ async function runManim(filePath, sceneName) {
       console.log(`📊 Output length: ${output.length} chars`);
       console.log(`📊 Errors length: ${errors.length} chars`);
 
-      // Log actual output to see what happened
       console.log(`\n📝 FULL MANIM OUTPUT:\n${output}\n`);
       if (errors) {
         console.log(`\n❌ FULL MANIM ERRORS:\n${errors}\n`);
       }
 
-      // Manim might output the video path in its logs
-      // Look for patterns like "File ready at" or ".mp4"
       const outputLines = output.split("\n");
       let detectedVideoPath = null;
 
@@ -483,7 +590,6 @@ async function runManim(filePath, sceneName) {
           line.includes(".mp4") &&
           (line.includes("File ready") || line.includes("ready at"))
         ) {
-          // Extract path from line
           const match = line.match(/['"]([^'"]+\.mp4)['"]/);
           if (match) {
             detectedVideoPath = match[1];
@@ -494,24 +600,20 @@ async function runManim(filePath, sceneName) {
         }
       }
 
-      // Try multiple search strategies
       const mediaRoot = join(scriptsPath, "media", "videos");
       console.log(`🔍 Searching for video in: ${mediaRoot}`);
 
       let videoPath = null;
 
-      // Strategy 1: Check if detected path exists
       if (detectedVideoPath && fs.existsSync(detectedVideoPath)) {
         videoPath = detectedVideoPath;
         console.log(`✅ Strategy 1: Using detected path from Manim output`);
       }
 
-      // Strategy 2: Use findLatestMp4
       if (!videoPath) {
         console.log(`📁 Media root exists: ${fs.existsSync(mediaRoot)}`);
 
         if (fs.existsSync(mediaRoot)) {
-          // List all subdirectories
           try {
             const subdirs = await readdir(mediaRoot, { withFileTypes: true });
             console.log(
@@ -533,7 +635,6 @@ async function runManim(filePath, sceneName) {
         }
       }
 
-      // Strategy 3: Search entire scripts directory for any new mp4
       if (!videoPath) {
         console.log(`🔍 Strategy 3: Searching entire scripts directory`);
         try {
@@ -561,7 +662,6 @@ async function runManim(filePath, sceneName) {
           await searchDir(scriptsPath);
 
           if (allMp4s.length > 0) {
-            // Sort by modification time
             allMp4s.sort((a, b) => b.mtime - a.mtime);
             videoPath = allMp4s[0].path;
             console.log(
@@ -585,16 +685,11 @@ async function runManim(filePath, sceneName) {
   });
 }
 
-/**
- * Recursively gather mp4 files and return the newest one.
- * Prefer the folder mediaRoot/sceneName if it exists.
- */
 async function findLatestMp4(mediaRoot, sceneName) {
   console.log(`🔍 findLatestMp4 called with:`);
   console.log(`   mediaRoot: ${mediaRoot}`);
   console.log(`   sceneName: ${sceneName}`);
 
-  // ensure mediaRoot exists
   try {
     const s = await stat(mediaRoot);
     if (!s.isDirectory()) {
@@ -606,7 +701,6 @@ async function findLatestMp4(mediaRoot, sceneName) {
     return null;
   }
 
-  // helper recursion
   async function gatherMp4(dir, acc = []) {
     let list;
     try {
@@ -626,11 +720,8 @@ async function findLatestMp4(mediaRoot, sceneName) {
     return acc;
   }
 
-  // try scene folder first with quality subfolder
   let candidates = [];
 
-  // Manim creates videos in mediaRoot/sceneName/quality/sceneName.mp4
-  // Quality folders: 480p15, 720p30, 1080p60, etc.
   const possibleQualityFolders = ["480p15", "720p30", "1080p60", "2160p60"];
 
   for (const quality of possibleQualityFolders) {
@@ -644,7 +735,6 @@ async function findLatestMp4(mediaRoot, sceneName) {
     }
   }
 
-  // Also check scene folder root
   const sceneFolder = join(mediaRoot, sceneName);
   console.log(`🔍 Checking scene folder: ${sceneFolder}`);
 
@@ -663,7 +753,6 @@ async function findLatestMp4(mediaRoot, sceneName) {
     console.log(`   Error checking scene folder: ${err.message}`);
   }
 
-  // if none, search whole mediaRoot
   if (!candidates.length) {
     console.log(`🔍 Searching entire media root...`);
     candidates = await gatherMp4(mediaRoot, []);
@@ -675,7 +764,6 @@ async function findLatestMp4(mediaRoot, sceneName) {
     return null;
   }
 
-  // pick most recently modified
   let newest = null;
   let newestMtime = 0;
   for (const f of candidates) {
@@ -693,12 +781,12 @@ async function findLatestMp4(mediaRoot, sceneName) {
 }
 
 /* -------------------- 11Labs TTS -------------------- */
-/**
- * Generate Nepali voice using ElevenLabs (11labs) API.
- * Expects ELEVENLABS_KEY and ELEVENLABS_VOICE_ID env vars.
- */
+
 async function generateNepaliVoice(text) {
   if (!ELEVENLABS_KEY) throw new Error("ELEVENLABS_API_KEY not set in .env");
+  if (!text || text.trim().length === 0) {
+    throw new Error("Cannot generate voice for empty text");
+  }
 
   const scriptsPath = join(__dirname, "scripts");
   await mkdir(scriptsPath, { recursive: true });
@@ -706,27 +794,262 @@ async function generateNepaliVoice(text) {
 
   const voiceId = ELEVENLABS_VOICE_ID;
 
+  console.log(`🎤 Requesting TTS from ElevenLabs`);
+  console.log(`   Voice ID: ${voiceId}`);
+  console.log(`   Text length: ${text.length} chars`);
+  console.log(`   Text preview: ${text.substring(0, 100)}...`);
+
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`;
   const payload = {
-    text,
+    text: text.trim(),
     model_id: "eleven_multilingual_v2",
-    voice_settings: { stability: 0.5, similarity_boost: 0.75 },
+    voice_settings: {
+      stability: 0.5,
+      similarity_boost: 0.75,
+      style: 0.0,
+      use_speaker_boost: true,
+    },
   };
 
-  console.log(`🎤 Requesting TTS from ElevenLabs for voice ID: ${voiceId}`);
+  try {
+    const resp = await axios.post(url, payload, {
+      headers: {
+        "xi-api-key": ELEVENLABS_KEY,
+        "Content-Type": "application/json",
+        Accept: "audio/mpeg",
+      },
+      responseType: "arraybuffer",
+      timeout: 120000,
+      validateStatus: (status) => status < 500,
+    });
 
-  const resp = await axios.post(url, payload, {
-    headers: {
-      "xi-api-key": ELEVENLABS_KEY,
-      "Content-Type": "application/json",
-    },
-    responseType: "arraybuffer",
-    timeout: 120000,
+    if (resp.status !== 200) {
+      const errorText = Buffer.from(resp.data).toString("utf-8");
+      console.error(`❌ ElevenLabs API error (${resp.status}):`, errorText);
+      throw new Error(`ElevenLabs API returned ${resp.status}: ${errorText}`);
+    }
+
+    const audioBuffer = Buffer.from(resp.data);
+    if (audioBuffer.length === 0) {
+      throw new Error("ElevenLabs returned empty audio data");
+    }
+
+    console.log(`✅ Received ${audioBuffer.length} bytes of audio data`);
+
+    await writeFile(outputPath, audioBuffer);
+
+    const stats = await stat(outputPath);
+    console.log(`✅ Voice file written: ${outputPath} (${stats.size} bytes)`);
+
+    await verifyAudioFile(outputPath);
+
+    return outputPath;
+  } catch (error) {
+    console.error("❌ ElevenLabs TTS error:", error.message);
+
+    if (error.response) {
+      console.error(`   Status: ${error.response.status}`);
+      console.error(`   Headers:`, error.response.headers);
+
+      try {
+        const errorBody = Buffer.from(error.response.data).toString("utf-8");
+        console.error(`   Body: ${errorBody}`);
+      } catch (e) {
+        console.error(`   Could not parse error body`);
+      }
+    }
+
+    throw error;
+  }
+}
+
+// -------------------- Audio helpers --------------------
+/** Get media duration in seconds using ffprobe */
+function getMediaDuration(filePath) {
+  return new Promise((resolve) => {
+    const p = spawn("ffprobe", [
+      "-v",
+      "error",
+      "-show_entries",
+      "format=duration",
+      "-of",
+      "default=noprint_wrappers=1:nokey=1",
+      filePath,
+    ]);
+    let out = "";
+    p.stdout.on("data", (d) => (out += d.toString()));
+    p.on("close", (code) => {
+      if (code === 0) {
+        const v = parseFloat(out.trim());
+        resolve(isNaN(v) ? 0 : v);
+      } else resolve(0);
+    });
+    p.on("error", () => resolve(0));
   });
+}
 
-  await writeFile(outputPath, Buffer.from(resp.data));
-  console.log(`✅ Voice generated at: ${outputPath}`);
-  return outputPath;
+/** Create a silent audio file of given duration (seconds) and return path */
+function createSilentAudio(durationSec, destPath) {
+  return new Promise((resolve, reject) => {
+    const dur = Math.max(0.5, Number(durationSec) || 1).toFixed(2);
+    const args = [
+      "-y",
+      "-f",
+      "lavfi",
+      "-i",
+      `anullsrc=channel_layout=stereo:sample_rate=44100`,
+      "-t",
+      dur,
+      "-c:a",
+      "aac",
+      "-b:a",
+      "128k",
+      destPath,
+    ];
+
+    const ff = spawn("ffmpeg", args);
+    let stderr = "";
+    ff.stderr.on("data", (d) => (stderr += d.toString()));
+    ff.on("close", (code) => {
+      if (code === 0 && fs.existsSync(destPath)) resolve(destPath);
+      else reject(new Error(`createSilentAudio failed: ${stderr}`));
+    });
+    ff.on("error", (e) => reject(e));
+  });
+}
+
+/** Ensure audio duration matches video duration by trimming or padding (returns path) */
+async function padOrTrimAudioToMatch(videoPath, audioPath, outputDir) {
+  // If audio doesn't exist, create silent audio of video duration
+  if (!audioPath || !fs.existsSync(audioPath)) {
+    const videoDur = await getMediaDuration(videoPath);
+    const out = join(outputDir, `silent_${Date.now()}.m4a`);
+    await createSilentAudio(videoDur || 1, out);
+    return out;
+  }
+
+  const videoDur = await getMediaDuration(videoPath);
+  const audioDur = await getMediaDuration(audioPath);
+  const eps = 0.05;
+
+  // If audio is longer than video, trim it
+  if (audioDur > videoDur + eps) {
+    const out = join(outputDir, `audio_trim_${Date.now()}.m4a`);
+    await new Promise((resolve, reject) => {
+      const ff = spawn("ffmpeg", [
+        "-y",
+        "-i",
+        audioPath,
+        "-t",
+        `${videoDur.toFixed(2)}`,
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        out,
+      ]);
+      let stderr = "";
+      ff.stderr.on("data", (d) => (stderr += d.toString()));
+      ff.on("close", (code) => {
+        if (code === 0 && fs.existsSync(out)) resolve(out);
+        else reject(new Error(`trim failed: ${stderr}`));
+      });
+      ff.on("error", (e) => reject(e));
+    });
+    return out;
+  }
+
+  // If audio is shorter, append silence
+  if (audioDur < videoDur - eps) {
+    const diff = Math.max(0.5, videoDur - audioDur);
+    const silentPart = join(outputDir, `pad_silent_${Date.now()}.m4a`);
+    await createSilentAudio(diff, silentPart);
+
+    const out = join(outputDir, `audio_padded_${Date.now()}.m4a`);
+    await new Promise((resolve, reject) => {
+      // concat two audio streams
+      const ff = spawn("ffmpeg", [
+        "-y",
+        "-i",
+        audioPath,
+        "-i",
+        silentPart,
+        "-filter_complex",
+        "[0:a][1:a]concat=n=2:v=0:a=1[a]",
+        "-map",
+        "[a]",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        out,
+      ]);
+      let stderr = "";
+      ff.stderr.on("data", (d) => (stderr += d.toString()));
+      ff.on("close", (code) => {
+        if (code === 0 && fs.existsSync(out)) resolve(out);
+        else reject(new Error(`pad concat failed: ${stderr}`));
+      });
+      ff.on("error", (e) => reject(e));
+    });
+    return out;
+  }
+
+  // Durations close enough — return original audioPath
+  return audioPath;
+}
+
+/** Ensure there's an audio file to merge and that its duration matches the video */
+async function ensureAudioForMerge(videoPath, audioPath, outputDir) {
+  await mkdir(outputDir, { recursive: true });
+  const prepared = await padOrTrimAudioToMatch(videoPath, audioPath, outputDir);
+  return prepared;
+}
+
+/** Verify an audio file exists and contains an audio stream. Returns metadata. */
+async function verifyAudioFile(filePath) {
+  if (!filePath || !fs.existsSync(filePath)) {
+    throw new Error(`Audio file does not exist: ${filePath}`);
+  }
+  const s = await stat(filePath);
+  const size = s.size || 0;
+  return new Promise((resolve) => {
+    const p = spawn("ffprobe", [
+      "-v",
+      "error",
+      "-print_format",
+      "json",
+      "-show_format",
+      "-show_streams",
+      filePath,
+    ]);
+    let out = "";
+    p.stdout.on("data", (d) => (out += d.toString()));
+    p.on("close", (code) => {
+      if (code !== 0)
+        return resolve({ exists: true, size, duration: 0, hasAudio: false });
+      try {
+        const info = JSON.parse(out || "{}");
+        const streams = info.streams || [];
+        const format = info.format || {};
+        const hasAudio = streams.some((st) => st.codec_type === "audio");
+        const duration = parseFloat(format.duration) || 0;
+        resolve({
+          exists: true,
+          size,
+          duration,
+          hasAudio,
+          format: format.format_name,
+          streams,
+        });
+      } catch (e) {
+        resolve({ exists: true, size, duration: 0, hasAudio: false });
+      }
+    });
+    p.on("error", () =>
+      resolve({ exists: true, size, duration: 0, hasAudio: false })
+    );
+  });
 }
 
 /* ==================================================================================
@@ -757,103 +1080,70 @@ async function mergeVideoAndAudio(videoPath, audioPath, options = {}) {
     audioBitrate = 192,
   } = options;
 
-  // Validate inputs
+  // Validate video exists
   if (!videoPath || !fs.existsSync(videoPath)) {
     throw new Error(`Video file not found: ${videoPath}`);
   }
-  if (!audioPath || !fs.existsSync(audioPath)) {
-    throw new Error(`Audio file not found: ${audioPath}`);
-  }
 
-  // Ensure output directory exists
+  // Prepare output dir and ensure audio matches video duration
   await mkdir(outputDir, { recursive: true });
-
   const outFile = join(outputDir, outputName);
+  const audioToUse = await ensureAudioForMerge(videoPath, audioPath, outputDir);
 
-  console.log(`🎬 Merging video and audio:`);
+  console.log(`🎬 Merging video and audio (prepared audio):`);
   console.log(`   📹 Video: ${videoPath}`);
-  console.log(`   🎤 Audio: ${audioPath}`);
+  console.log(`   🎤 Audio: ${audioToUse}`);
   console.log(`   💾 Output: ${outFile}`);
 
   return new Promise((resolve, reject) => {
     const ffmpegArgs = [
-      "-y", // Overwrite output file
+      "-y",
       "-i",
-      videoPath, // Input video
+      videoPath,
       "-i",
-      audioPath, // Input audio
+      audioToUse,
       "-map",
-      "0:v:0", // Map video from first input
+      "0:v:0",
       "-map",
-      "1:a:0", // Map audio from second input
+      "1:a:0",
       "-c:v",
-      videoCodec, // Video codec
+      videoCodec,
       "-c:a",
-      audioCodec, // Audio codec
+      audioCodec,
     ];
 
-    // Add audio bitrate if not copying
-    if (audioCodec !== "copy") {
-      ffmpegArgs.push("-b:a", `${audioBitrate}k`);
-    }
-
-    // Use shortest stream to avoid issues with different lengths
-    if (shortest) {
-      ffmpegArgs.push("-shortest");
-    }
-
+    if (audioCodec !== "copy") ffmpegArgs.push("-b:a", `${audioBitrate}k`);
+    // audio already matches video duration; shortest is safe but optional
+    if (shortest) ffmpegArgs.push("-shortest");
     ffmpegArgs.push(outFile);
 
     console.log(`🔧 Running ffmpeg with args: ${ffmpegArgs.join(" ")}`);
 
     const ff = spawn("ffmpeg", ffmpegArgs);
-
-    let stdout = "";
     let stderr = "";
-
-    ff.stdout.on("data", (data) => {
-      const text = data.toString();
-      stdout += text;
-      console.log("[ffmpeg stdout]", text);
-    });
-
     ff.stderr.on("data", (data) => {
       const text = data.toString();
       stderr += text;
-      // ffmpeg outputs progress to stderr
-      if (text.includes("time=") || text.includes("frame=")) {
+      if (text.includes("time=") || text.includes("frame="))
         process.stdout.write(`\r${text.trim()}`);
-      }
     });
-
-    ff.on("error", (error) => {
-      reject(new Error(`Failed to start ffmpeg: ${error.message}`));
-    });
-
+    ff.on("error", (error) =>
+      reject(new Error(`Failed to start ffmpeg: ${error.message}`))
+    );
     ff.on("close", (code) => {
-      console.log(); // New line after progress output
-
-      if (code === 0) {
-        // Verify output file exists and has size > 0
-        if (fs.existsSync(outFile)) {
-          const stats = fs.statSync(outFile);
-          if (stats.size > 0) {
-            console.log(`✅ Successfully merged video and audio`);
-            console.log(
-              `   📊 Output size: ${(stats.size / (1024 * 1024)).toFixed(2)} MB`
-            );
-            console.log(`   📍 Location: ${outFile}`);
-            resolve(outFile);
-          } else {
-            reject(new Error("Output file created but has zero size"));
-          }
-        } else {
-          reject(new Error("Output file was not created"));
-        }
+      console.log();
+      if (code === 0 && fs.existsSync(outFile)) {
+        const stats = fs.statSync(outFile);
+        if (stats.size > 0) {
+          console.log(`✅ Successfully merged video and audio`);
+          console.log(
+            `   📊 Output size: ${(stats.size / (1024 * 1024)).toFixed(2)} MB`
+          );
+          console.log(`   📍 Location: ${outFile}`);
+          resolve(outFile);
+        } else reject(new Error("Output file created but has zero size"));
       } else {
-        const errorMsg = `ffmpeg exited with code ${code}\n${stderr}`;
-        console.error(`❌ ${errorMsg}`);
-        reject(new Error(errorMsg));
+        reject(new Error(`ffmpeg exited with code ${code}\n${stderr}`));
       }
     });
   });
@@ -884,16 +1174,14 @@ async function mergeVideoAndAudioWithVolume(
   if (!videoPath || !fs.existsSync(videoPath)) {
     throw new Error(`Video file not found: ${videoPath}`);
   }
-  if (!audioPath || !fs.existsSync(audioPath)) {
-    throw new Error(`Audio file not found: ${audioPath}`);
-  }
 
   await mkdir(outputDir, { recursive: true });
   const outFile = join(outputDir, outputName);
+  const audioToUse = await ensureAudioForMerge(videoPath, audioPath, outputDir);
 
   console.log(`🎬 Merging with volume adjustment (${volumeLevel}x):`);
   console.log(`   📹 Video: ${videoPath}`);
-  console.log(`   🎤 Audio: ${audioPath}`);
+  console.log(`   🎤 Audio: ${audioToUse}`);
   console.log(`   💾 Output: ${outFile}`);
 
   return new Promise((resolve, reject) => {
@@ -902,7 +1190,7 @@ async function mergeVideoAndAudioWithVolume(
       "-i",
       videoPath,
       "-i",
-      audioPath,
+      audioToUse,
       "-filter_complex",
       `[1:a]volume=${volumeLevel}[a]`,
       "-map",
@@ -967,16 +1255,14 @@ async function mergeVideoAndAudioWithFade(
   if (!videoPath || !fs.existsSync(videoPath)) {
     throw new Error(`Video file not found: ${videoPath}`);
   }
-  if (!audioPath || !fs.existsSync(audioPath)) {
-    throw new Error(`Audio file not found: ${audioPath}`);
-  }
 
   await mkdir(outputDir, { recursive: true });
   const outFile = join(outputDir, outputName);
+  const audioToUse = await ensureAudioForMerge(videoPath, audioPath, outputDir);
 
   console.log(`🎬 Merging with audio fade effects:`);
   console.log(`   📹 Video: ${videoPath}`);
-  console.log(`   🎤 Audio: ${audioPath}`);
+  console.log(`   🎤 Audio: ${audioToUse}`);
   console.log(
     `   ⏱️  Fade in: ${fadeInDuration}s, Fade out: ${fadeOutDuration}s`
   );
@@ -1010,7 +1296,7 @@ async function mergeVideoAndAudioWithFade(
         "-i",
         videoPath,
         "-i",
-        audioPath,
+        audioToUse,
         "-filter_complex",
         `[1:a]afade=t=in:st=0:d=${fadeInDuration},afade=t=out:st=${fadeOutStart}:d=${fadeOutDuration}[a]`,
         "-map",
@@ -1076,16 +1362,14 @@ async function mergeVideoAndAudioWithFilter(
   if (!videoPath || !fs.existsSync(videoPath)) {
     throw new Error(`Video file not found: ${videoPath}`);
   }
-  if (!audioPath || !fs.existsSync(audioPath)) {
-    throw new Error(`Audio file not found: ${audioPath}`);
-  }
 
   await mkdir(outputDir, { recursive: true });
   const outFile = join(outputDir, outputName);
+  const audioToUse = await ensureAudioForMerge(videoPath, audioPath, outputDir);
 
   console.log(`🎬 Merging with custom audio filter:`);
   console.log(`   📹 Video: ${videoPath}`);
-  console.log(`   🎤 Audio: ${audioPath}`);
+  console.log(`   🎤 Audio: ${audioToUse}`);
   console.log(`   🎛️  Filter: ${audioFilter}`);
   console.log(`   💾 Output: ${outFile}`);
 
@@ -1095,7 +1379,7 @@ async function mergeVideoAndAudioWithFilter(
       "-i",
       videoPath,
       "-i",
-      audioPath,
+      audioToUse,
       "-filter_complex",
       `[1:a]${audioFilter}[a]`,
       "-map",
