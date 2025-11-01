@@ -109,11 +109,15 @@ app.post("/generateVideo", async (req, res) => {
     console.log("🎤 Generating voice for:", narrationText);
     const voicePath = await generateNepaliVoice(narrationText);
 
-    // 4) Merge video + audio
+    // 4) Merge video + audio (enhanced version)
     console.log("🎬 Merging video and audio...");
     const finalVideoPath = await mergeVideoAndAudio(
       fixedCodeResult.videoPath,
-      voicePath
+      voicePath,
+      {
+        outputName: `${scenePlan.scene_name}_final_${Date.now()}.mp4`,
+        audioBitrate: 192,
+      }
     );
 
     res.json({
@@ -725,21 +729,172 @@ async function generateNepaliVoice(text) {
   return outputPath;
 }
 
-/* -------------------- FFMPEG merge -------------------- */
-async function mergeVideoAndAudio(videoPath, audioPath) {
-  if (!videoPath || !fs.existsSync(videoPath))
-    throw new Error("Video not found for merging: " + videoPath);
-  if (!audioPath || !fs.existsSync(audioPath))
-    throw new Error("Audio not found for merging: " + audioPath);
+/* ==================================================================================
+   ENHANCED FFMPEG MERGE FUNCTIONS
+   ================================================================================== */
 
-  const outDir = join(__dirname, "scripts", "outputs");
-  await mkdir(outDir, { recursive: true });
+/**
+ * Enhanced function to merge video and audio using ffmpeg
+ *
+ * @param {string} videoPath - Path to the video file
+ * @param {string} audioPath - Path to the audio file
+ * @param {Object} options - Optional configuration
+ * @param {string} options.outputDir - Custom output directory (default: scripts/outputs)
+ * @param {string} options.outputName - Custom output filename (default: final_TIMESTAMP.mp4)
+ * @param {string} options.videoCodec - Video codec (default: 'copy' for no re-encoding)
+ * @param {string} options.audioCodec - Audio codec (default: 'aac')
+ * @param {boolean} options.shortest - Use shortest stream (default: true)
+ * @param {number} options.audioBitrate - Audio bitrate in kbps (default: 192)
+ * @returns {Promise<string>} Path to the merged video file
+ */
+async function mergeVideoAndAudio(videoPath, audioPath, options = {}) {
+  const {
+    outputDir = join(__dirname, "scripts", "outputs"),
+    outputName = `final_${Date.now()}.mp4`,
+    videoCodec = "copy",
+    audioCodec = "aac",
+    shortest = true,
+    audioBitrate = 192,
+  } = options;
 
-  const outFile = join(outDir, `final_${Date.now()}.mp4`);
+  // Validate inputs
+  if (!videoPath || !fs.existsSync(videoPath)) {
+    throw new Error(`Video file not found: ${videoPath}`);
+  }
+  if (!audioPath || !fs.existsSync(audioPath)) {
+    throw new Error(`Audio file not found: ${audioPath}`);
+  }
 
-  console.log(
-    `🎬 Merging:\n  Video: ${videoPath}\n  Audio: ${audioPath}\n  Output: ${outFile}`
-  );
+  // Ensure output directory exists
+  await mkdir(outputDir, { recursive: true });
+
+  const outFile = join(outputDir, outputName);
+
+  console.log(`🎬 Merging video and audio:`);
+  console.log(`   📹 Video: ${videoPath}`);
+  console.log(`   🎤 Audio: ${audioPath}`);
+  console.log(`   💾 Output: ${outFile}`);
+
+  return new Promise((resolve, reject) => {
+    const ffmpegArgs = [
+      "-y", // Overwrite output file
+      "-i",
+      videoPath, // Input video
+      "-i",
+      audioPath, // Input audio
+      "-map",
+      "0:v:0", // Map video from first input
+      "-map",
+      "1:a:0", // Map audio from second input
+      "-c:v",
+      videoCodec, // Video codec
+      "-c:a",
+      audioCodec, // Audio codec
+    ];
+
+    // Add audio bitrate if not copying
+    if (audioCodec !== "copy") {
+      ffmpegArgs.push("-b:a", `${audioBitrate}k`);
+    }
+
+    // Use shortest stream to avoid issues with different lengths
+    if (shortest) {
+      ffmpegArgs.push("-shortest");
+    }
+
+    ffmpegArgs.push(outFile);
+
+    console.log(`🔧 Running ffmpeg with args: ${ffmpegArgs.join(" ")}`);
+
+    const ff = spawn("ffmpeg", ffmpegArgs);
+
+    let stdout = "";
+    let stderr = "";
+
+    ff.stdout.on("data", (data) => {
+      const text = data.toString();
+      stdout += text;
+      console.log("[ffmpeg stdout]", text);
+    });
+
+    ff.stderr.on("data", (data) => {
+      const text = data.toString();
+      stderr += text;
+      // ffmpeg outputs progress to stderr
+      if (text.includes("time=") || text.includes("frame=")) {
+        process.stdout.write(`\r${text.trim()}`);
+      }
+    });
+
+    ff.on("error", (error) => {
+      reject(new Error(`Failed to start ffmpeg: ${error.message}`));
+    });
+
+    ff.on("close", (code) => {
+      console.log(); // New line after progress output
+
+      if (code === 0) {
+        // Verify output file exists and has size > 0
+        if (fs.existsSync(outFile)) {
+          const stats = fs.statSync(outFile);
+          if (stats.size > 0) {
+            console.log(`✅ Successfully merged video and audio`);
+            console.log(
+              `   📊 Output size: ${(stats.size / (1024 * 1024)).toFixed(2)} MB`
+            );
+            console.log(`   📍 Location: ${outFile}`);
+            resolve(outFile);
+          } else {
+            reject(new Error("Output file created but has zero size"));
+          }
+        } else {
+          reject(new Error("Output file was not created"));
+        }
+      } else {
+        const errorMsg = `ffmpeg exited with code ${code}\n${stderr}`;
+        console.error(`❌ ${errorMsg}`);
+        reject(new Error(errorMsg));
+      }
+    });
+  });
+}
+
+/**
+ * Alternative: Merge with audio volume adjustment
+ * Useful when audio is too loud or too quiet
+ *
+ * @param {string} videoPath - Path to the video file
+ * @param {string} audioPath - Path to the audio file
+ * @param {number} volumeLevel - Volume multiplier (1.0 = 100%, 0.5 = 50%, 2.0 = 200%)
+ * @param {Object} options - Optional configuration
+ * @returns {Promise<string>} Path to the merged video file
+ */
+async function mergeVideoAndAudioWithVolume(
+  videoPath,
+  audioPath,
+  volumeLevel = 1.0,
+  options = {}
+) {
+  const {
+    outputDir = join(__dirname, "scripts", "outputs"),
+    outputName = `final_volume_${Date.now()}.mp4`,
+  } = options;
+
+  // Validate inputs
+  if (!videoPath || !fs.existsSync(videoPath)) {
+    throw new Error(`Video file not found: ${videoPath}`);
+  }
+  if (!audioPath || !fs.existsSync(audioPath)) {
+    throw new Error(`Audio file not found: ${audioPath}`);
+  }
+
+  await mkdir(outputDir, { recursive: true });
+  const outFile = join(outputDir, outputName);
+
+  console.log(`🎬 Merging with volume adjustment (${volumeLevel}x):`);
+  console.log(`   📹 Video: ${videoPath}`);
+  console.log(`   🎤 Audio: ${audioPath}`);
+  console.log(`   💾 Output: ${outFile}`);
 
   return new Promise((resolve, reject) => {
     const ff = spawn("ffmpeg", [
@@ -748,10 +903,12 @@ async function mergeVideoAndAudio(videoPath, audioPath) {
       videoPath,
       "-i",
       audioPath,
+      "-filter_complex",
+      `[1:a]volume=${volumeLevel}[a]`,
       "-map",
       "0:v:0",
       "-map",
-      "1:a:0",
+      "[a]",
       "-c:v",
       "copy",
       "-c:a",
@@ -761,17 +918,215 @@ async function mergeVideoAndAudio(videoPath, audioPath) {
     ]);
 
     let stderr = "";
-    ff.stderr.on("data", (d) => {
-      stderr += d.toString();
-      console.log("[ffmpeg]", d.toString());
+
+    ff.stderr.on("data", (data) => {
+      const text = data.toString();
+      stderr += text;
+      if (text.includes("time=")) {
+        process.stdout.write(`\r${text.trim()}`);
+      }
     });
 
     ff.on("close", (code) => {
+      console.log();
       if (code === 0 && fs.existsSync(outFile)) {
-        console.log(`✅ Final video with audio created: ${outFile}`);
+        console.log(
+          `✅ Successfully merged with volume adjustment: ${outFile}`
+        );
         resolve(outFile);
       } else {
-        reject(new Error("ffmpeg merge failed. code=" + code + "\n" + stderr));
+        reject(new Error(`ffmpeg failed with code ${code}\n${stderr}`));
+      }
+    });
+  });
+}
+
+/**
+ * Alternative: Merge and add fade in/out effects to audio
+ * Creates professional-sounding transitions
+ *
+ * @param {string} videoPath - Path to the video file
+ * @param {string} audioPath - Path to the audio file
+ * @param {number} fadeInDuration - Fade in duration in seconds (default: 0.5)
+ * @param {number} fadeOutDuration - Fade out duration in seconds (default: 0.5)
+ * @param {Object} options - Optional configuration
+ * @returns {Promise<string>} Path to the merged video file
+ */
+async function mergeVideoAndAudioWithFade(
+  videoPath,
+  audioPath,
+  fadeInDuration = 0.5,
+  fadeOutDuration = 0.5,
+  options = {}
+) {
+  const {
+    outputDir = join(__dirname, "scripts", "outputs"),
+    outputName = `final_fade_${Date.now()}.mp4`,
+  } = options;
+
+  if (!videoPath || !fs.existsSync(videoPath)) {
+    throw new Error(`Video file not found: ${videoPath}`);
+  }
+  if (!audioPath || !fs.existsSync(audioPath)) {
+    throw new Error(`Audio file not found: ${audioPath}`);
+  }
+
+  await mkdir(outputDir, { recursive: true });
+  const outFile = join(outputDir, outputName);
+
+  console.log(`🎬 Merging with audio fade effects:`);
+  console.log(`   📹 Video: ${videoPath}`);
+  console.log(`   🎤 Audio: ${audioPath}`);
+  console.log(
+    `   ⏱️  Fade in: ${fadeInDuration}s, Fade out: ${fadeOutDuration}s`
+  );
+  console.log(`   💾 Output: ${outFile}`);
+
+  return new Promise((resolve, reject) => {
+    // First, get video duration
+    const ffprobe = spawn("ffprobe", [
+      "-v",
+      "error",
+      "-show_entries",
+      "format=duration",
+      "-of",
+      "default=noprint_wrappers=1:nokey=1",
+      videoPath,
+    ]);
+
+    let duration = "";
+    ffprobe.stdout.on("data", (data) => {
+      duration += data.toString();
+    });
+
+    ffprobe.on("close", () => {
+      const durationSec = parseFloat(duration.trim());
+      const fadeOutStart = Math.max(0, durationSec - fadeOutDuration);
+
+      console.log(`   📊 Video duration: ${durationSec.toFixed(2)}s`);
+
+      const ff = spawn("ffmpeg", [
+        "-y",
+        "-i",
+        videoPath,
+        "-i",
+        audioPath,
+        "-filter_complex",
+        `[1:a]afade=t=in:st=0:d=${fadeInDuration},afade=t=out:st=${fadeOutStart}:d=${fadeOutDuration}[a]`,
+        "-map",
+        "0:v:0",
+        "-map",
+        "[a]",
+        "-c:v",
+        "copy",
+        "-c:a",
+        "aac",
+        "-shortest",
+        outFile,
+      ]);
+
+      let stderr = "";
+
+      ff.stderr.on("data", (data) => {
+        const text = data.toString();
+        stderr += text;
+        if (text.includes("time=")) {
+          process.stdout.write(`\r${text.trim()}`);
+        }
+      });
+
+      ff.on("close", (code) => {
+        console.log();
+        if (code === 0 && fs.existsSync(outFile)) {
+          console.log(`✅ Successfully merged with fade effects: ${outFile}`);
+          resolve(outFile);
+        } else {
+          reject(new Error(`ffmpeg failed with code ${code}\n${stderr}`));
+        }
+      });
+    });
+
+    ffprobe.on("error", (error) => {
+      reject(new Error(`Failed to get video duration: ${error.message}`));
+    });
+  });
+}
+
+/**
+ * Advanced: Merge video and audio with custom audio filters
+ * Allows for complex audio processing
+ *
+ * @param {string} videoPath - Path to the video file
+ * @param {string} audioPath - Path to the audio file
+ * @param {string} audioFilter - Custom ffmpeg audio filter string
+ * @param {Object} options - Optional configuration
+ * @returns {Promise<string>} Path to the merged video file
+ */
+async function mergeVideoAndAudioWithFilter(
+  videoPath,
+  audioPath,
+  audioFilter,
+  options = {}
+) {
+  const {
+    outputDir = join(__dirname, "scripts", "outputs"),
+    outputName = `final_custom_${Date.now()}.mp4`,
+  } = options;
+
+  if (!videoPath || !fs.existsSync(videoPath)) {
+    throw new Error(`Video file not found: ${videoPath}`);
+  }
+  if (!audioPath || !fs.existsSync(audioPath)) {
+    throw new Error(`Audio file not found: ${audioPath}`);
+  }
+
+  await mkdir(outputDir, { recursive: true });
+  const outFile = join(outputDir, outputName);
+
+  console.log(`🎬 Merging with custom audio filter:`);
+  console.log(`   📹 Video: ${videoPath}`);
+  console.log(`   🎤 Audio: ${audioPath}`);
+  console.log(`   🎛️  Filter: ${audioFilter}`);
+  console.log(`   💾 Output: ${outFile}`);
+
+  return new Promise((resolve, reject) => {
+    const ff = spawn("ffmpeg", [
+      "-y",
+      "-i",
+      videoPath,
+      "-i",
+      audioPath,
+      "-filter_complex",
+      `[1:a]${audioFilter}[a]`,
+      "-map",
+      "0:v:0",
+      "-map",
+      "[a]",
+      "-c:v",
+      "copy",
+      "-c:a",
+      "aac",
+      "-shortest",
+      outFile,
+    ]);
+
+    let stderr = "";
+
+    ff.stderr.on("data", (data) => {
+      const text = data.toString();
+      stderr += text;
+      if (text.includes("time=")) {
+        process.stdout.write(`\r${text.trim()}`);
+      }
+    });
+
+    ff.on("close", (code) => {
+      console.log();
+      if (code === 0 && fs.existsSync(outFile)) {
+        console.log(`✅ Successfully merged with custom filter: ${outFile}`);
+        resolve(outFile);
+      } else {
+        reject(new Error(`ffmpeg failed with code ${code}\n${stderr}`));
       }
     });
   });
